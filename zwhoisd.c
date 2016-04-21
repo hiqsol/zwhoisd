@@ -84,7 +84,6 @@ parse_args (int argc, char *argv[]) {
       case 'a' :
         if (inet_pton(AF_INET,  optarg, &(listen_sin4.sin_addr)) == 1)
             break;
-        printf("opt: %s\n", optarg);
         if (inet_pton(AF_INET6, optarg, &(listen_sin6.sin6_addr)) != 1)
             return(-1);
         ipv6_mode = 1;
