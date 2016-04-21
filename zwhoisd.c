@@ -15,39 +15,41 @@
 #include <sys/resource.h>
 #include <pwd.h>
 
-extern int	errno;
+extern int errno;
+extern uint32_t hashlittle( const void *key, size_t length, uint32_t initval);
 
-int 		daemon_mode = 0;
-int 		thread_mode = 0;
+int                 daemon_mode = 0;
+int                 thread_mode = 0;
+int                 ipv6_mode   = 0;
 
-char		path2templates[256];
-char		path2data[256];
-size_t		path2data_len;
-char		path2log[256];
-char		path2pid[256];
-char		username[16];
-int		listen_sock;
-struct sockaddr_in	listen_sin;
+char                path2templates[256];
+char                path2data[256];
+size_t              path2data_len;
+char                path2log[256];
+char                path2pid[256];
+char                username[16];
+int                 listen_sock;
+struct sockaddr_in  listen_sin4;
+struct sockaddr_in6 listen_sin6;
+struct iovec        tpl[3];
+struct sf_hdtr      hdtr;
 
-#define	TPL_NOTFOUND	0
-#define	TPL_HEADER	1
-#define	TPL_FOOTER	2
+#define TPL_NOTFOUND        0
+#define TPL_HEADER          1
+#define TPL_FOOTER          2
 
-struct iovec	tpl[3];
-struct sf_hdtr	hdtr;
-
-#define	REQUEST_BUF_SIZE	256
+#define REQUEST_BUF_SIZE    256
 
 static void
 print_usage (void) {
-  fprintf(stderr, "Usage: zwhoisd -t /path/to/templates/ -w /path/to/whois/data/ -l /path/to/log/file -a listen_addr [-p /path/to/pidfile] [-u user] [-d] [-m]\n\t-d - daemon mode\n\t-m - multithreaded mode\n");
+    fprintf(stderr, "Usage: zwhoisd -t /path/to/templates/ -w /path/to/whois/data/ -l /path/to/log/file -a listen_addr [-p /path/to/pidfile] [-u user] [-d] [-m] \n\t-d - daemon mode\n\t-m - multithreaded mode\n");
 }
 
 static int
 parse_args (int argc, char *argv[]) {
-  int		ch;
-  size_t	len;
-  
+  int       ch;
+  size_t    len;
+
   while ((ch = getopt(argc, argv, "t:w:l:a:p:u:dm")) != -1) {
     switch (ch) {
       case 'd' :
@@ -55,12 +57,13 @@ parse_args (int argc, char *argv[]) {
         break;
       case 'm' :
         thread_mode = 1;
+        break;
       case 't' :
         len = strlen(optarg);
         if(sizeof(path2templates) < len + 2)
           return(-1);
         memcpy(path2templates, optarg, len + 1);
-        if(path2templates[len - 1] != '/') {		// add trailing '/'
+        if(path2templates[len - 1] != '/') {        // add trailing '/'
           path2templates[len] = '/';
           path2templates[len + 1] = '\0';
         }
@@ -79,8 +82,12 @@ parse_args (int argc, char *argv[]) {
         strncpy(path2log, optarg, sizeof(path2log));
         break;
       case 'a' :
-        if(inet_aton(optarg, &(listen_sin.sin_addr)) != 1)
-          return(-1);
+        if (inet_pton(AF_INET,  optarg, &(listen_sin4.sin_addr)) == 1)
+            break;
+        printf("opt: %s\n", optarg);
+        if (inet_pton(AF_INET6, optarg, &(listen_sin6.sin6_addr)) != 1)
+            return(-1);
+        ipv6_mode = 1;
         break;
       case 'p' :
         strncpy(path2pid, optarg, sizeof(path2pid));
@@ -95,10 +102,10 @@ parse_args (int argc, char *argv[]) {
 
 int
 print2log(const char * format, ...) {
-  FILE			*fd_log;
-  static struct timeval	currtime;
-  static char		time_buf[32];
-  va_list		ap;
+  FILE          *fd_log;
+  static struct timeval    currtime;
+  static char   time_buf[32];
+  va_list       ap;
 
   fd_log = fopen(path2log, "a");
   if(fd_log == NULL)
@@ -108,16 +115,16 @@ print2log(const char * format, ...) {
     return(errno);
   if(! ctime_r(&currtime.tv_sec, time_buf))
     return(-1);
-  time_buf[24] = '\0';		// clear '\n'
+  time_buf[24] = '\0';        // clear '\n'
 
-  if(daemon_mode == 0)
+  if (!daemon_mode)
     fprintf(stderr, "%s\t", time_buf);
-  if(0 >= fprintf(fd_log, "%s\t", time_buf))
+  if (0 >= fprintf(fd_log, "%s\t", time_buf))
     return(-1);
   va_start(ap, format);
-  if(daemon_mode == 0)
+  if (!daemon_mode)
     vfprintf(stderr, format, ap);
-  if(0 >= vfprintf(fd_log, format, ap)) {
+  if (0 >= vfprintf(fd_log, format, ap)) {
     va_end(ap);
     return(-1);
   }
@@ -129,12 +136,12 @@ print2log(const char * format, ...) {
 
 int
 load_tpl(struct iovec *tpl_ref, char *name) {
-  char		tpl_path[256];
-  size_t	path_len;
-  size_t	name_len;
-  int		tpl_fd, ret;
-  struct stat	sb;
-  void		*tpl_data;
+  char          tpl_path[256];
+  size_t        path_len;
+  size_t        name_len;
+  int           tpl_fd, ret;
+  struct stat   sb;
+  void          *tpl_data;
 
   memcpy(tpl_path, path2templates, 256);
   path_len = strlen(tpl_path);
@@ -145,7 +152,7 @@ load_tpl(struct iovec *tpl_ref, char *name) {
   }
   memcpy(&(tpl_path[path_len]), name, name_len);
   tpl_path[path_len+name_len] = '\0';
-  
+
   tpl_fd = open(tpl_path, O_RDONLY);
   if(tpl_fd == -1) {
     print2log("Can't open template %s: %s\n", tpl_path, strerror(errno));
@@ -173,7 +180,7 @@ load_tpl(struct iovec *tpl_ref, char *name) {
       free(tpl_ref->iov_base);
     tpl_ref->iov_base = tpl_data;
     tpl_ref->iov_len = ret;
-  } else {				// empty template, not a problem
+  } else {                // empty template, not a problem
     if(tpl_ref->iov_base != NULL) {
       free(tpl_ref->iov_base);
       tpl_ref->iov_base = NULL;
@@ -186,12 +193,12 @@ load_tpl(struct iovec *tpl_ref, char *name) {
 
 int
 basic_init() {
-  int		err, fd;
-  int		sockopt = 1;
-  struct accept_filter_arg	accf_arg;
-  struct rlimit	flim;
-  FILE		*f_pid;
-  struct passwd	*pw_info;
+  int           err, fd;
+  int           sockopt = 1;
+  struct accept_filter_arg    accf_arg;
+  struct rlimit flim;
+  FILE          *f_pid;
+  struct passwd *pw_info;
 
   if(*path2templates == '\0') {
     fprintf(stderr, "Path to templates is not specified\n");
@@ -207,7 +214,7 @@ basic_init() {
   }
 
 // try to open logfile
-  if(err = print2log("zwhoisd\n")) {
+  if((err = print2log("zwhoisd\n"))) {
     if(err > 0)
       fprintf(stderr, "Fail to log: %s\n", strerror(err));
     return(-1);
@@ -246,14 +253,11 @@ basic_init() {
   }
 
 // open socket
-  listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+  listen_sock = socket(ipv6_mode ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
   if(listen_sock == -1) {
     print2log("Fail to create socket: %s\n", strerror(errno));
     return(-1);
   }
-
-  listen_sin.sin_family = AF_INET;
-  listen_sin.sin_port = htons(43);
 
   err = setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof(sockopt));
   if(err == -1) {
@@ -261,12 +265,20 @@ basic_init() {
     return(-1);
   }
 
-  err = bind(listen_sock, (struct sockaddr *)&listen_sin, sizeof(listen_sin));
+  if (ipv6_mode) {
+    listen_sin6.sin6_family = AF_INET6;
+    listen_sin6.sin6_port = htons(43);
+    err = bind(listen_sock, (struct sockaddr *)&listen_sin6, sizeof(listen_sin6));
+  } else {
+    listen_sin4.sin_family = AF_INET;
+    listen_sin4.sin_port = htons(43);
+    err = bind(listen_sock, (struct sockaddr *)&listen_sin4, sizeof(listen_sin4));
+  }
   if(err == -1) {
     print2log("Fail to bind socket: %s\n", strerror(errno));
     return(-1);
   }
- 
+
   err = listen(listen_sock, -1);
   if(err == -1) {
     print2log("Fail to listen socket: %s\n", strerror(errno));
@@ -320,219 +332,9 @@ basic_init() {
   return(0);
 }
 
-// hashing stuff
-#if (defined(__BYTE_ORDER) && defined(__LITTLE_ENDIAN) && \
-     __BYTE_ORDER == __LITTLE_ENDIAN) || \
-    (defined(i386) || defined(__i386__) || defined(__i486__) || \
-     defined(__i586__) || defined(__i686__) || defined(vax) || defined(MIPSEL))
-# define HASH_LITTLE_ENDIAN 1
-# define HASH_BIG_ENDIAN 0
-#elif (defined(__BYTE_ORDER) && defined(__BIG_ENDIAN) && \
-       __BYTE_ORDER == __BIG_ENDIAN) || \
-      (defined(sparc) || defined(POWERPC) || defined(mc68000) || defined(sel))
-# define HASH_LITTLE_ENDIAN 0
-# define HASH_BIG_ENDIAN 1
-#else
-# define HASH_LITTLE_ENDIAN 0
-# define HASH_BIG_ENDIAN 0
-#endif
-
-#define hashsize(n) ((uint32_t)1<<(n))
-#define hashmask(n) (hashsize(n)-1)
-#define rot(x,k) (((x)<<(k)) | ((x)>>(32-(k))))
-
-#define mix(a,b,c) \
-{ \
-  a -= c;  a ^= rot(c, 4);  c += b; \
-  b -= a;  b ^= rot(a, 6);  a += c; \
-  c -= b;  c ^= rot(b, 8);  b += a; \
-  a -= c;  a ^= rot(c,16);  c += b; \
-  b -= a;  b ^= rot(a,19);  a += c; \
-  c -= b;  c ^= rot(b, 4);  b += a; \
-}
-
-#define final(a,b,c) \
-{ \
-  c ^= b; c -= rot(b,14); \
-  a ^= c; a -= rot(c,11); \
-  b ^= a; b -= rot(a,25); \
-  c ^= b; c -= rot(b,16); \
-  a ^= c; a -= rot(c,4);  \
-  b ^= a; b -= rot(a,14); \
-  c ^= b; c -= rot(b,24); \
-}
-uint32_t hashlittle( const void *key, size_t length, uint32_t initval)
-{
-  uint32_t a,b,c;                                          /* internal state */
-  union { const void *ptr; size_t i; } u;     /* needed for Mac Powerbook G4 */
-
-  /* Set up the internal state */
-  a = b = c = 0xdeadbeef + ((uint32_t)length) + initval;
-
-  u.ptr = key;
-  if (HASH_LITTLE_ENDIAN && ((u.i & 0x3) == 0)) {
-    const uint32_t *k = (const uint32_t *)key;         /* read 32-bit chunks */
-    const uint8_t  *k8;
-
-    /*------ all but last block: aligned reads and affect 32 bits of (a,b,c) */
-    while (length > 12)
-    {
-      a += k[0];
-      b += k[1];
-      c += k[2];
-      mix(a,b,c);
-      length -= 12;
-      k += 3;
-    }
-
-    /*----------------------------- handle the last (probably partial) block */
-    /* 
-     * "k[2]&0xffffff" actually reads beyond the end of the string, but
-     * then masks off the part it's not allowed to read.  Because the
-     * string is aligned, the masked-off tail is in the same word as the
-     * rest of the string.  Every machine with memory protection I've seen
-     * does it on word boundaries, so is OK with this.  But VALGRIND will
-     * still catch it and complain.  The masking trick does make the hash
-     * noticably faster for short strings (like English words).
-     */
-#ifndef VALGRIND
-
-    switch(length)
-    {
-    case 12: c+=k[2]; b+=k[1]; a+=k[0]; break;
-    case 11: c+=k[2]&0xffffff; b+=k[1]; a+=k[0]; break;
-    case 10: c+=k[2]&0xffff; b+=k[1]; a+=k[0]; break;
-    case 9 : c+=k[2]&0xff; b+=k[1]; a+=k[0]; break;
-    case 8 : b+=k[1]; a+=k[0]; break;
-    case 7 : b+=k[1]&0xffffff; a+=k[0]; break;
-    case 6 : b+=k[1]&0xffff; a+=k[0]; break;
-    case 5 : b+=k[1]&0xff; a+=k[0]; break;
-    case 4 : a+=k[0]; break;
-    case 3 : a+=k[0]&0xffffff; break;
-    case 2 : a+=k[0]&0xffff; break;
-    case 1 : a+=k[0]&0xff; break;
-    case 0 : return c;              /* zero length strings require no mixing */
-    }
-
-#else /* make valgrind happy */
-
-    k8 = (const uint8_t *)k;
-    switch(length)
-    {
-    case 12: c+=k[2]; b+=k[1]; a+=k[0]; break;
-    case 11: c+=((uint32_t)k8[10])<<16;  /* fall through */
-    case 10: c+=((uint32_t)k8[9])<<8;    /* fall through */
-    case 9 : c+=k8[8];                   /* fall through */
-    case 8 : b+=k[1]; a+=k[0]; break;
-    case 7 : b+=((uint32_t)k8[6])<<16;   /* fall through */
-    case 6 : b+=((uint32_t)k8[5])<<8;    /* fall through */
-    case 5 : b+=k8[4];                   /* fall through */
-    case 4 : a+=k[0]; break;
-    case 3 : a+=((uint32_t)k8[2])<<16;   /* fall through */
-    case 2 : a+=((uint32_t)k8[1])<<8;    /* fall through */
-    case 1 : a+=k8[0]; break;
-    case 0 : return c;
-    }
-
-#endif /* !valgrind */
-
-  } else if (HASH_LITTLE_ENDIAN && ((u.i & 0x1) == 0)) {
-    const uint16_t *k = (const uint16_t *)key;         /* read 16-bit chunks */
-    const uint8_t  *k8;
-
-    /*--------------- all but last block: aligned reads and different mixing */
-    while (length > 12)
-    {
-      a += k[0] + (((uint32_t)k[1])<<16);
-      b += k[2] + (((uint32_t)k[3])<<16);
-      c += k[4] + (((uint32_t)k[5])<<16);
-      mix(a,b,c);
-      length -= 12;
-      k += 6;
-    }
-
-    /*----------------------------- handle the last (probably partial) block */
-    k8 = (const uint8_t *)k;
-    switch(length)
-    {
-    case 12: c+=k[4]+(((uint32_t)k[5])<<16);
-             b+=k[2]+(((uint32_t)k[3])<<16);
-             a+=k[0]+(((uint32_t)k[1])<<16);
-             break;
-    case 11: c+=((uint32_t)k8[10])<<16;     /* fall through */
-    case 10: c+=k[4];
-             b+=k[2]+(((uint32_t)k[3])<<16);
-             a+=k[0]+(((uint32_t)k[1])<<16);
-             break;
-    case 9 : c+=k8[8];                      /* fall through */
-    case 8 : b+=k[2]+(((uint32_t)k[3])<<16);
-             a+=k[0]+(((uint32_t)k[1])<<16);
-             break;
-    case 7 : b+=((uint32_t)k8[6])<<16;      /* fall through */
-    case 6 : b+=k[2];
-             a+=k[0]+(((uint32_t)k[1])<<16);
-             break;
-    case 5 : b+=k8[4];                      /* fall through */
-    case 4 : a+=k[0]+(((uint32_t)k[1])<<16);
-             break;
-    case 3 : a+=((uint32_t)k8[2])<<16;      /* fall through */
-    case 2 : a+=k[0];
-             break;
-    case 1 : a+=k8[0];
-             break;
-    case 0 : return c;                     /* zero length requires no mixing */
-    }
-
-  } else {                        /* need to read the key one byte at a time */
-    const uint8_t *k = (const uint8_t *)key;
-
-    /*--------------- all but the last block: affect some 32 bits of (a,b,c) */
-    while (length > 12)
-    {
-      a += k[0];
-      a += ((uint32_t)k[1])<<8;
-      a += ((uint32_t)k[2])<<16;
-      a += ((uint32_t)k[3])<<24;
-      b += k[4];
-      b += ((uint32_t)k[5])<<8;
-      b += ((uint32_t)k[6])<<16;
-      b += ((uint32_t)k[7])<<24;
-      c += k[8];
-      c += ((uint32_t)k[9])<<8;
-      c += ((uint32_t)k[10])<<16;
-      c += ((uint32_t)k[11])<<24;
-      mix(a,b,c);
-      length -= 12;
-      k += 12;
-    }
-
-    /*-------------------------------- last block: affect all 32 bits of (c) */
-    switch(length)                   /* all the case statements fall through */
-    {
-    case 12: c+=((uint32_t)k[11])<<24;
-    case 11: c+=((uint32_t)k[10])<<16;
-    case 10: c+=((uint32_t)k[9])<<8;
-    case 9 : c+=k[8];
-    case 8 : b+=((uint32_t)k[7])<<24;
-    case 7 : b+=((uint32_t)k[6])<<16;
-    case 6 : b+=((uint32_t)k[5])<<8;
-    case 5 : b+=k[4];
-    case 4 : a+=((uint32_t)k[3])<<24;
-    case 3 : a+=((uint32_t)k[2])<<16;
-    case 2 : a+=((uint32_t)k[1])<<8;
-    case 1 : a+=k[0];
-             break;
-    case 0 : return c;
-    }
-  }
-
-  final(a,b,c);
-  return c;
-}
-
 void
 not_found(int conn) {
-  int	ret;
+  int    ret;
 
   ret = write(conn, tpl[TPL_NOTFOUND].iov_base, tpl[TPL_NOTFOUND].iov_len);
   if(ret == -1) {
@@ -553,21 +355,23 @@ const char ascii[256] = {
    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, 
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
 };
-#define DOMAIN_STRLEN		7
-#define NAMESERVER_STRLEN	11
+
+#define DOMAIN_STRLEN        7
+#define NAMESERVER_STRLEN    11
 int
 process_request(int conn, char *request, ssize_t request_size) {
-  char		domain_path[256];
-  char		domain_name[REQUEST_BUF_SIZE];
-  int		i, hash_val, path_size, dom_fd, ret;
-  struct stat	sb;
-  off_t		sbytes;
+  char          domain_path[256];
+  char          domain_name[REQUEST_BUF_SIZE];
+  int           i, path_size, dom_fd, ret;
+  uint32_t      hash_val;
+  struct stat   sb;
+  off_t         sbytes;
 
   bzero(domain_name, REQUEST_BUF_SIZE);
 
@@ -591,7 +395,7 @@ process_request(int conn, char *request, ssize_t request_size) {
     }
   }
 
-  while(request[0] == '.' || request[0] == ' ') {	// remove all leading dots and spaces
+  while(request[0] == '.' || request[0] == ' ') {    // remove all leading dots and spaces
     request++;
     request_size--;
     if(request_size <= 0)
@@ -603,22 +407,22 @@ process_request(int conn, char *request, ssize_t request_size) {
     request_size--;
   }
 
-  while(request[request_size - 1] == '.') {		// remove all trailing dots
+  while(request[request_size - 1] == '.') {        // remove all trailing dots
     request_size--;
     if(request_size <= 0)
       return(-1);
   }
 
   for(i = 0; i < request_size; i++) {
-    if(ascii[request[i]] == 0)				// wrong character
+    if(ascii[request[i]] == 0)                // wrong character
       return(-1);
     domain_name[i] = ascii[request[i]];
   }
 
   hash_val = hashlittle(domain_name, request_size, 1928374650);
-  hash_val &= 0xfff;			// use 12 bits of hash value (0..4095)
+  hash_val &= 0xfff;            // use 12 bits of hash value (0..4095)
 
-  path_size = snprintf(domain_path, sizeof(domain_path), "%s%04hu/%s", path2data, hash_val, domain_name);
+  path_size = snprintf(domain_path, sizeof(domain_path), "%s%04u/%s", path2data, hash_val, domain_name);
   if(path_size == sizeof(domain_path) - 1 || path_size <= 0) {
     print2log("Too long path size '%s' for domain '%s' (hash_val %04hu)\n", domain_path, domain_name, hash_val);
     return(-1);
@@ -626,7 +430,7 @@ process_request(int conn, char *request, ssize_t request_size) {
 
 // open file with whois data for requested domain, obtained fd will be used in sendfile()
   dom_fd = open(domain_path, O_RDONLY);
-  if(dom_fd == -1) {			// no such record for this domain
+  if(dom_fd == -1) {            // no such record for this domain
     print2log("No record for '%s' (hash_val %04hu): %s\n", domain_name, hash_val, strerror(errno));
     not_found(conn);
     return(0);
@@ -644,11 +448,11 @@ process_request(int conn, char *request, ssize_t request_size) {
 
 int
 main_loop(void) {
-  int		conn, err;
-  ssize_t	size;
-  struct sockaddr_in 	remote_sin;
-  socklen_t	sin_size = sizeof(remote_sin);
-  char		request[REQUEST_BUF_SIZE];
+  int       conn, err;
+  ssize_t   size;
+  struct    sockaddr_in6 remote_sin;
+  socklen_t sin_size = sizeof(remote_sin);
+  char      request[REQUEST_BUF_SIZE];
 
   for(;;) {
     conn = accept(listen_sock, (struct sockaddr *)&remote_sin, &sin_size);
@@ -692,26 +496,25 @@ main_loop(void) {
 
 int
 start_threads() {
-  
-
-  return(0);
+    return(0);
 }
 
 int
-main (int argc, char *argv[]) {
-  bzero(&listen_sin, sizeof(listen_sin));
+main(int argc, char *argv[]) {
+    bzero(&listen_sin4, sizeof(listen_sin4));
 
-  if (parse_args(argc, argv) < 0) {
-    print_usage();
-    exit(1);
-  }
-  if (basic_init() != 0) {
-    print_usage();
-    exit(0);
-  }
+    if (parse_args(argc, argv) < 0) {
+        print_usage();
+        exit(1);
+    }
+    if (basic_init() != 0) {
+        print_usage();
+        exit(0);
+    }
 
-  if(thread_mode)
-    start_threads();
-  else
-    main_loop();
+    if (thread_mode)
+        start_threads();
+    else
+        main_loop();
 }
+
