@@ -496,25 +496,26 @@ main_loop(void) {
 
 int
 start_threads() {
-    return(0);
+  return(0);
 }
 
 int
 main(int argc, char *argv[]) {
-    bzero(&listen_sin4, sizeof(listen_sin4));
+  bzero(&listen_sin4, sizeof(listen_sin4));
+  bzero(&listen_sin6, sizeof(listen_sin6));
 
-    if (parse_args(argc, argv) < 0) {
-        print_usage();
-        exit(1);
-    }
-    if (basic_init() != 0) {
-        print_usage();
-        exit(0);
-    }
+  if (parse_args(argc, argv) < 0) {
+    print_usage();
+    exit(1);
+  }
+  if (basic_init() != 0) {
+    print_usage();
+    exit(0);
+  }
 
-    if (thread_mode)
-        start_threads();
-    else
-        main_loop();
+  if (thread_mode)
+    start_threads();
+  else
+    main_loop();
 }
 
